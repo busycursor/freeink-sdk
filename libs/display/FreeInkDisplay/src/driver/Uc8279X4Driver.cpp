@@ -208,6 +208,50 @@ constexpr GrayBank kQualityBank = makeQualityBank();
 // table order (inx-pro's empirically found assignment for this panel).
 constexpr uint8_t kQualityLutReg[5] = {0x20, 0x21, 0x23, 0x22, 0x24};
 
+// Single-pass anti-aliasing action tables (registers 0x20..0x24). Each pixel's
+// two plane bits select an action, and code k runs register 0x21 + k
+// (calibrated on an X4 Pro, panel revision 0x68):
+//   0 hold      idle
+//   1 to white  lighten for the stock settle drive (25 frames)
+//   2 to black  darken for 25 frames
+//   3 to gray   darken for 25 frames, then lighten for the stock gray pulse
+// Rail 1 darkens and rail 2 lightens on this panel. The gray pulse is the stock
+// AA pulse for the revision: 2 frames (QY, 0x02/0x03) or 3 (ZHX and others).
+// All tables end on the same frame; VCOM idles throughout.
+struct ActionBank {
+  uint8_t data[5][GRAY_LUT_LEN]{};
+};
+
+constexpr ActionBank makeActionBank(const uint8_t grayFrames) {
+  constexpr uint8_t kDrive = 25;
+  constexpr uint8_t kIdle = 0, kDarken = 1, kLighten = 2;
+  ActionBank bank{};
+  const auto phase = [](uint8_t rail, uint8_t frames) { return static_cast<uint8_t>((rail << 6) | frames); };
+  const uint8_t phases[5][2] = {
+      {phase(kIdle, kDrive + grayFrames), 0},                 // 0x20 VCOM
+      {phase(kIdle, kDrive + grayFrames), 0},                 // 0x21 hold
+      {phase(kLighten, kDrive), phase(kIdle, grayFrames)},    // 0x22 to white
+      {phase(kDarken, kDrive), phase(kIdle, grayFrames)},     // 0x23 to black
+      {phase(kDarken, kDrive), phase(kLighten, grayFrames)},  // 0x24 to gray
+  };
+  for (uint8_t t = 0; t < 5; t++) {
+    bank.data[t][0] = 0x01;
+    bank.data[t][1] = phases[t][0];
+    bank.data[t][2] = phases[t][1];
+    bank.data[t][5] = 0x01;
+    bank.data[t][6] = 0x01;
+  }
+  return bank;
+}
+
+constexpr ActionBank kActionBankQy = makeActionBank(2);
+constexpr ActionBank kActionBankZhx = makeActionBank(3);
+
+const ActionBank& selectActionBank() {
+  const uint8_t v = BoardConfig::ACTIVE.displayControllerVariant;
+  return (v == 0x02 || v == 0x03) ? kActionBankQy : kActionBankZhx;
+}
+
 }  // namespace
 
 const Uc8279X4Config& uc8279X4DefaultConfig() {
@@ -608,6 +652,34 @@ GrayscaleCapabilities Uc8279X4Driver::grayscaleCapabilities(GrayscaleMode mode) 
   return {GrayscaleEncoding::OverlayMasks, GrayscaleBase::Separate, false, false, false};
 }
 
+bool Uc8279X4Driver::setExperimentLut(const ExperimentBank bank, const uint8_t table, const uint8_t* data,
+                                      const size_t len) {
+  const uint8_t b = static_cast<uint8_t>(bank);
+  // Settle tables are 42 bytes (PREBW_LUT_LEN); the gray/direct banks 49.
+  const size_t want = bank == ExperimentBank::Settle ? PREBW_LUT_LEN : GRAY_LUT_LEN;
+  if (b > 2 || table > 4 || data == nullptr || len != want) return false;
+  memcpy(_experiment[b].data[table], data, len);
+  _experiment[b].active[table] = true;
+  return true;
+}
+
+void Uc8279X4Driver::recordTiming(const RefreshTimings& t) {
+  _timingLog[_timingNext] = t;
+  _timingNext = static_cast<uint8_t>((_timingNext + 1) % kTimingLog);
+  if (_timingCount < kTimingLog) ++_timingCount;
+}
+
+size_t Uc8279X4Driver::recentRefreshTimings(RefreshTimings* out, const size_t max) const {
+  size_t n = 0;
+  for (; n < max && n < _timingCount; ++n) out[n] = _timingLog[(_timingNext + kTimingLog - 1 - n) % kTimingLog];
+  return n;
+}
+
+void Uc8279X4Driver::clearExperimentLuts() {
+  for (auto& bank : _experiment) bank = ExperimentTables{};
+  _directFullClear = true;
+}
+
 void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMode mode, RefreshMode fallback,
                                     bool turnOff) {
   _grayImagePass = false;
@@ -619,7 +691,7 @@ void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMod
     _grayBaseValid = false;
     _absoluteGrayPlanes = false;
     _oldPlaneValid = false;
-    _needFullClear = true;
+    _needFullClear = directFullClear();
     _redriveAfterGray = false;
     return;
   }
@@ -629,6 +701,12 @@ void Uc8279X4Driver::beginGrayscale(EpdBus& bus, const uint8_t* fb, GrayscaleMod
 
 void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
   if (!lsb) return;
+  const uint32_t tStream = micros();
+  struct StreamClock {
+    uint32_t& acc;
+    uint32_t start;
+    ~StreamClock() { acc += micros() - start; }
+  } streamClock{_streamUsSinceRefresh, tStream};
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
     streamPlane(bus, CMD_DTM1, lsb, true);
@@ -657,6 +735,11 @@ void Uc8279X4Driver::copyGrayscaleLsb(EpdBus& bus, const uint8_t* lsb) {
 
 void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
   if (!msb) return;
+  struct StreamClock {
+    uint32_t& acc;
+    uint32_t start;
+    ~StreamClock() { acc += micros() - start; }
+  } streamClock{_streamUsSinceRefresh, static_cast<uint32_t>(micros())};
   if (_absoluteInput) {
     bus.waitBusy(" absolute plane");
     streamPlane(bus, CMD_DTM2, msb, true);
@@ -685,6 +768,11 @@ void Uc8279X4Driver::copyGrayscaleMsb(EpdBus& bus, const uint8_t* msb) {
 void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, const unsigned char* lut,
                                  bool factoryMode) {
   (void)lut;
+  const uint32_t tStart = micros();
+  RefreshTimings timing;
+  timing.pass = _directGrayPass ? "direct" : "gray";
+  timing.streamUs = _streamUsSinceRefresh;
+  _streamUsSinceRefresh = 0;
 
   // Vendor AA sequence: PSR (REG=1) -> [planes already in RAM via
   // copyGrayscale*] -> 5x49 LUTs -> CDI (constant 0x97) -> PON -> PSR rewrite ->
@@ -693,24 +781,38 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   bus.data(_cfg.psr0);  // 0x33: REG=1, external LUT
   bus.data(_cfg.psr1);
   // Complete image planes need four tones; sparse overlay AA keeps the short stock bank.
+  // Experiment tables replace stock ones register by register (0x20 + index,
+  // no 0x22/0x23 exchange: calibration decides which register drives which tone).
+  const auto& directExp = _experiment[static_cast<uint8_t>(ExperimentBank::Direct)];
+  const auto& overlayExp = _experiment[static_cast<uint8_t>(ExperimentBank::Overlay)];
   if (_directGrayPass || _absoluteInput || factoryMode || _grayImagePass) {
     for (int i = 0; i < 5; i++) {
       bus.cmd(kQualityLutReg[i]);
       bus.data(kQualityBank.data[i], GRAY_LUT_LEN);
     }
+    if (_directGrayPass) {
+      const ActionBank& actions = selectActionBank();
+      for (int i = 0; i < 5; i++) {
+        if (!directExp.active[i] && !_directActions) continue;
+        bus.cmd(static_cast<uint8_t>(0x20 + i));
+        bus.data(directExp.active[i] ? directExp.data[i] : actions.data[i], GRAY_LUT_LEN);
+      }
+    }
   } else {
     for (int i = 0; i < 5; i++) {
       const auto& lut = selectAaLuts()[i];
       bus.cmd(lut.cmd);
-      bus.data(lut.data, GRAY_LUT_LEN);
+      bus.data(overlayExp.active[i] ? overlayExp.data[i] : lut.data, GRAY_LUT_LEN);
     }
   }
+  const uint32_t tLut = micros();
   _grayImagePass = false;
   bus.cmd(CMD_VCOM_DATA_INTERVAL);
   bus.data(_cfg.cdiAa);  // constant 0x97 every AA refresh (stock; no first/later split)
   _grayRefreshedOnce = true;
 
   powerOnIfNeeded(bus, " 8279x4_gray_PON");
+  const uint32_t tPowerOn = micros();
 
   // The reference rewrites PSR once more between PON and DRF.
   bus.cmd(CMD_PANEL_SETTING);
@@ -719,6 +821,7 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
 
   bus.cmd(CMD_DISPLAY_REFRESH);
   bus.waitBusy((_directGrayPass ? " 8279x4_DIRECT_GRAY_DRF" : " 8279x4_gray"));
+  const uint32_t tRefresh = micros();
   // Vendor production behavior: the UC8279 AA path leaves analog power enabled
   // between page refreshes (the UC8179 sibling does the same — its gray_aa sends
   // no POF). Honor only an explicit turnOff.
@@ -727,6 +830,14 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
     bus.waitBusy(" 8279x4_gray_POF");
     _isScreenOn = false;
   }
+  const uint32_t tEnd = micros();
+  timing.lutUs = tLut - tStart;
+  timing.powerOnUs = tPowerOn - tLut;
+  timing.refreshUs = tRefresh - tPowerOn;
+  timing.powerOffUs = tEnd - tRefresh;
+  timing.totalUs = tEnd - tStart + timing.streamUs;
+  timing.atMs = millis();
+  recordTiming(timing);
 
   // Restore the clean B/W base to BOTH controller planes (stock gray_aa does the
   // same). `_grayBase` was rebuilt to the base = plane0 & plane1 in
@@ -747,9 +858,13 @@ void Uc8279X4Driver::displayGray(EpdBus& bus, const uint8_t* fb, bool turnOff, c
   // flag the next B/W page to re-drive every pixel to its target (see
   // displayStart), scrubbing residue with a cheap DU — an explicit Half GC
   // remains the strong purge.
-  _directGrayOnPanel = _directGrayPass;
-  _redriveAfterGray = !_directGrayPass;
-  if (_directGrayPass) _needFullClear = true;
+  // Without the post-Direct full clear (experiment), the caller re-seeds the
+  // OLD plane instead, so the next B/W page needs no target-paint pass.
+  _directGrayOnPanel = _directGrayPass && directFullClear();
+  // An experiment may skip the post-Direct full clear; the next B/W page then
+  // re-drives every pixel instead (cleanupGrayscaleBuffers re-seeds OLD).
+  _redriveAfterGray = !_directGrayPass || !directFullClear();
+  if (_directGrayPass && directFullClear()) _needFullClear = true;
   _grayImagePass = false;
   _absoluteInput = false;
   _directGrayPass = false;
@@ -832,15 +947,29 @@ void Uc8279X4Driver::runGrayscalePrecondition(EpdBus& bus) {
   bus.data(_cfg.ccset);
   bus.cmd(CMD_TSSET);
   bus.data(_cfg.tssetFast);  // 0x5A
-  for (const auto& l : kXtfPreBwMid) {
+  const auto& settleExp = _experiment[static_cast<uint8_t>(ExperimentBank::Settle)];
+  const uint32_t tStart = micros();
+  for (uint8_t i = 0; i < 5; i++) {
+    const auto& l = kXtfPreBwMid[i];
     bus.cmd(l[0]);
-    bus.data(&l[1], PREBW_LUT_LEN);
+    bus.data(settleExp.active[i] ? settleExp.data[i] : &l[1], PREBW_LUT_LEN);
   }
+  const uint32_t tLut = micros();
 
   powerOnIfNeeded(bus, " 8279x4_gray_pre_PON");
+  const uint32_t tPowerOn = micros();
   bus.cmd(CMD_DISPLAY_REFRESH);
   bus.waitBusy(" 8279x4_gray_pre_DRF");
+  const uint32_t tRefresh = micros();
   bus.cmd(CMD_PARTIAL_OUT);
+  RefreshTimings timing;
+  timing.pass = "settle";
+  timing.lutUs = tLut - tStart;
+  timing.powerOnUs = tPowerOn - tLut;
+  timing.refreshUs = tRefresh - tPowerOn;
+  timing.totalUs = tRefresh - tStart;
+  timing.atMs = millis();
+  recordTiming(timing);
 }
 
 void Uc8279X4Driver::cleanupGrayscaleBuffers(EpdBus& bus, const uint8_t* bw) {

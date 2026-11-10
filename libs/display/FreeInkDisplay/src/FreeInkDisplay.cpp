@@ -896,6 +896,29 @@ void FreeInkDisplay::displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t 
 #endif
 }
 
+bool FreeInkDisplay::setExperimentLut(const ExperimentBank bank, const uint8_t table, const uint8_t* data,
+                                      const size_t len) {
+  return _driver && _driver->setExperimentLut(bank, table, data, len);
+}
+
+void FreeInkDisplay::clearExperimentLuts() {
+  if (_driver) _driver->clearExperimentLuts();
+}
+
+void FreeInkDisplay::setDirectFullClear(const bool enabled) {
+  if (_driver) _driver->setDirectFullClear(enabled);
+}
+
+bool FreeInkDisplay::supportsDirectActions() const { return _driver && _driver->supportsDirectActions(); }
+
+void FreeInkDisplay::setDirectActions(const bool enabled) {
+  if (_driver) _driver->setDirectActions(enabled);
+}
+
+size_t FreeInkDisplay::recentRefreshTimings(RefreshTimings* out, const size_t max) const {
+  return _driver ? _driver->recentRefreshTimings(out, max) : 0;
+}
+
 void FreeInkDisplay::displayGrayBuffer(bool turnOffScreen, const unsigned char* lut, bool factoryMode) {
 #if defined(SSD1677_PROBE_DEBUG) && SSD1677_PROBE_DEBUG
   Serial.printf("[EPD] displayGrayBuffer\n");

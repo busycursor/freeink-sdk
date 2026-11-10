@@ -15,6 +15,7 @@
 #include <Arduino.h>
 
 #include "../../include/GrayscaleCapabilities.h"
+#include "../../include/WaveformExperiment.h"
 #include "../bus/EpdBus.h"
 
 namespace freeink {
@@ -273,6 +274,31 @@ class PanelDriver {
   // full, so the drag stays flash-free. Clear it and force one full afterward to
   // scrub any accumulated ghost. No-op on drivers without a periodic-full cadence.
   virtual void setHoldPeriodicFull(bool hold) { (void)hold; }
+
+  // --- Waveform experiments (host tools; see WaveformExperiment.h) ---------
+  // `table` is the LUT register offset from 0x20 (0 = VCOM). Drivers without
+  // support ignore all of this.
+  virtual bool setExperimentLut(ExperimentBank bank, uint8_t table, const uint8_t* data, size_t len) {
+    (void)bank;
+    (void)table;
+    (void)data;
+    (void)len;
+    return false;
+  }
+  virtual void clearExperimentLuts() {}
+  // Direct passes normally force a full clear before the next B/W page.
+  virtual void setDirectFullClear(bool enabled) { (void)enabled; }
+  // Single-pass anti-aliasing: Direct passes carry per-pixel ACTIONS (code 0
+  // hold, 1 to white, 2 to black, 3 to gray) driven by the driver's built-in
+  // action tables, with no full clear. Off: Direct is the four-tone quality pass.
+  virtual bool supportsDirectActions() const { return false; }
+  virtual void setDirectActions(bool enabled) { (void)enabled; }
+  // Most recent refreshes, newest first; returns how many were written.
+  virtual size_t recentRefreshTimings(RefreshTimings* out, size_t max) const {
+    (void)out;
+    (void)max;
+    return 0;
+  }
   virtual void grayscaleRevert(EpdBus& bus, const uint8_t* fb) {
     (void)bus;
     (void)fb;

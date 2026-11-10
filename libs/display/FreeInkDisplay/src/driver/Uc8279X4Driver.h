@@ -64,6 +64,13 @@ const Uc8279X4Config& uc8279X4DefaultConfig();
 class Uc8279X4Driver : public PanelDriver {
  public:
   const char* controllerName() const override { return "UC8279"; }
+
+  bool setExperimentLut(ExperimentBank bank, uint8_t table, const uint8_t* data, size_t len) override;
+  void clearExperimentLuts() override;
+  void setDirectFullClear(bool enabled) override { _directFullClear = enabled; }
+  bool supportsDirectActions() const override { return true; }
+  void setDirectActions(bool enabled) override { _directActions = enabled; }
+  size_t recentRefreshTimings(RefreshTimings* out, size_t max) const override;
   explicit Uc8279X4Driver(const Uc8279X4Config& cfg = uc8279X4DefaultConfig());
 
   uint32_t spiHz() const override;
@@ -148,6 +155,25 @@ class Uc8279X4Driver : public PanelDriver {
 
   bool _isScreenOn = false;
   bool _needFullClear = true;
+
+  // Waveform experiments: per-bank replacement tables (see PanelDriver).
+  static constexpr uint8_t kExperimentLutMax = 49;
+  struct ExperimentTables {
+    bool active[5] = {};
+    uint8_t data[5][kExperimentLutMax] = {};
+  };
+  ExperimentTables _experiment[3];
+  bool _directFullClear = true;
+  bool _directActions = false;
+  // Full clear after a Direct pass: the quality pass needs it, action passes
+  // leave a coherent panel and re-seed the OLD plane instead.
+  bool directFullClear() const { return _directFullClear && !_directActions; }
+  static constexpr uint8_t kTimingLog = 6;
+  RefreshTimings _timingLog[kTimingLog];
+  uint8_t _timingNext = 0;
+  uint8_t _timingCount = 0;
+  void recordTiming(const RefreshTimings& t);
+  uint32_t _streamUsSinceRefresh = 0;
   bool _oldPlaneValid = false;
 
   // Grayscale absolute-plane state (ported from UC8179). `_grayBase` holds the

@@ -18,6 +18,7 @@
 
 #include "../src/bus/EpdBus.h"
 #include "GrayscaleCapabilities.h"
+#include "WaveformExperiment.h"
 
 namespace freeink {
 
@@ -280,6 +281,15 @@ class FreeInkDisplay {
   // EXPERIMENTAL: Windowed update - display only a rectangular region
   void displayWindow(uint16_t x, uint16_t y, uint16_t w, uint16_t h, bool turnOffScreen = false);
   void displayGrayBuffer(bool turnOffScreen = false, const unsigned char* lut = nullptr, bool factoryMode = false);
+
+  // Waveform experiments (host tools): see WaveformExperiment.h.
+  bool setExperimentLut(ExperimentBank bank, uint8_t table, const uint8_t* data, size_t len);
+  void clearExperimentLuts();
+  void setDirectFullClear(bool enabled);
+  // Single-pass anti-aliasing (see PanelDriver::setDirectActions).
+  bool supportsDirectActions() const;
+  void setDirectActions(bool enabled);
+  size_t recentRefreshTimings(RefreshTimings* out, size_t max) const;
   void displayGrayCalibration(uint16_t customX, uint16_t customY, uint16_t customW, uint16_t customH);
 
   void refreshDisplay(RefreshMode mode = FAST_REFRESH, bool turnOffScreen = false);
